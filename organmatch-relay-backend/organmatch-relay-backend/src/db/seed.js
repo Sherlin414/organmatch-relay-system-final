@@ -1,144 +1,210 @@
+import 'dotenv/config';
 import bcrypt from 'bcryptjs';
-import { pool } from './pool.js';
+import { connectDB, disconnectDB } from './connection.js';
+import {
+  Hospital,
+  Jurisdiction,
+  User,
+  Vehicle,
+  Patient,
+} from '../models/index.js';
 
-// Simple deterministic-ish HLA marker generator: 6 marker "slots" (like the
-// 6-antigen HLA-A/B/DR match panel used in real transplant matching), each
-// drawn from a small pool so overlaps happen often enough to matter.
 function randomHlaMarkers() {
   const pool6 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
   const shuffled = [...pool6].sort(() => Math.random() - 0.5);
   return shuffled.slice(0, 6);
 }
 
-async function seed() {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const { rows: [stXavier] } = await client.query(
-      `INSERT INTO hospitals (name, location_lat, location_lng, type, address)
-       VALUES ('St. Xavier Medical Center', 13.0827, 80.2707, 'donor', 'Chennai, TN')
-       RETURNING id`
-    );
-    const { rows: [cityGeneral] } = await client.query(
-      `INSERT INTO hospitals (name, location_lat, location_lng, type, address)
-       VALUES ('City General Hospital', 13.0604, 80.2496, 'recipient', 'Chennai, TN')
-       RETURNING id`
-    );
-
-    // ---------- Three jurisdictions along the donor -> recipient corridor ----------
-    const { rows: [sector12] } = await client.query(
-      `INSERT INTO jurisdictions (name, control_room_contact, sequence_hint)
-       VALUES ('Sector 12 Traffic Control', '+91 44 2222 1111', 1)
-       RETURNING id`
-    );
-    const { rows: [sector7] } = await client.query(
-      `INSERT INTO jurisdictions (name, control_room_contact, sequence_hint)
-       VALUES ('Sector 7 Traffic Control', '+91 44 2222 2222', 2)
-       RETURNING id`
-    );
-    const { rows: [mgRoad] } = await client.query(
-      `INSERT INTO jurisdictions (name, control_room_contact, sequence_hint)
-       VALUES ('MG Road Junction Control', '+91 44 2222 3333', 3)
-       RETURNING id`
-    );
-
-    const passwordHash = await bcrypt.hash('password123', 10);
-
-    const { rows: [doctor] } = await client.query(
-      `INSERT INTO users (name, email, password_hash, role, contact_number, hospital_id, license_number)
-       VALUES ('Dr. Fatima Rahman', 'doctor@organmatch.dev', $1, 'DOCTOR', '+91 98450 11122', $2, 'MED-88213')
-       RETURNING id`,
-      [passwordHash, stXavier.id]
-    );
-
-    await client.query(
-      `INSERT INTO users (name, email, password_hash, role, contact_number, hospital_id)
-       VALUES ('Kavya Suresh', 'admin@organmatch.dev', $1, 'HOSPITAL_ADMIN', '+91 90000 11223', $2)`,
-      [passwordHash, cityGeneral.id]
-    );
-
-    await client.query(
-      `INSERT INTO users (name, email, password_hash, role, contact_number, hospital_id)
-       VALUES ('Rahul Verma', 'donor@organmatch.dev', $1, 'DONOR_COORDINATOR', '+91 99887 66554', $2)`,
-      [passwordHash, stXavier.id]
-    );
-
-    await client.query(
-      `INSERT INTO users (name, email, password_hash, role, contact_number, organization_name)
-       VALUES ('Ananya Iyer', 'sysadmin@organmatch.dev', $1, 'SYSTEM_ADMIN', '+91 91234 56780', 'National Organ Registry')`,
-      [passwordHash]
-    );
-
-    const { rows: [ambulanceDriver] } = await client.query(
-      `INSERT INTO users (name, email, password_hash, role, contact_number, license_id)
-       VALUES ('Suresh Kumar', 'ambulance@organmatch.dev', $1, 'AMBULANCE', '+91 97865 43221', 'DL-44219')
-       RETURNING id`,
-      [passwordHash]
-    );
-
-    // Three police officers, one per jurisdiction, so the cascading handoff
-    // is genuinely observable across three different logins.
-    await client.query(
-      `INSERT INTO users (name, email, password_hash, role, contact_number, station_name, jurisdiction_id)
-       VALUES ('Inspector Vikram Singh', 'police@organmatch.dev', $1, 'POLICE', '+91 90111 22334', 'Sector 12 Traffic Control', $2)`,
-      [passwordHash, sector12.id]
-    );
-    await client.query(
-      `INSERT INTO users (name, email, password_hash, role, contact_number, station_name, jurisdiction_id)
-       VALUES ('Inspector Meena Pillai', 'police2@organmatch.dev', $1, 'POLICE', '+91 90111 33445', 'Sector 7 Traffic Control', $2)`,
-      [passwordHash, sector7.id]
-    );
-    await client.query(
-      `INSERT INTO users (name, email, password_hash, role, contact_number, station_name, jurisdiction_id)
-       VALUES ('Inspector Arjun Reddy', 'police3@organmatch.dev', $1, 'POLICE', '+91 90111 44556', 'MG Road Junction Control', $2)`,
-      [passwordHash, mgRoad.id]
-    );
-
-    const { rows: [patientUser] } = await client.query(
-      `INSERT INTO users (name, email, password_hash, role, contact_number, organ_needed, blood_type, urgency_score, registered_hospital_name, waitlist_status)
-       VALUES ('Arjun Menon', 'patient@organmatch.dev', $1, 'PATIENT', '+91 98765 43210', 'Kidney', 'O+', 92.4, 'City General Hospital', 'Matched')
-       RETURNING id`,
-      [passwordHash]
-    );
-
-    await client.query(
-      `INSERT INTO vehicles (code, registration_number, status, driver_id)
-       VALUES ('AMB-114', 'TN-09-AB-4521', 'Idle', $1)`,
-      [ambulanceDriver.id]
-    );
-
-    // ---------- Patients (waitlist), each with HLA markers ----------
-    const patients = [
-      ['P-10432', patientUser.id, 'Arjun Menon', 'Kidney', 'O+', 92.4, 'Matched'],
-      ['P-10388', doctor.id, 'Priya Nair', 'Liver', 'B+', 78.1, 'Waiting'],
-      ['P-10391', doctor.id, 'Rohan Das', 'Heart', 'A-', 74.6, 'Waiting'],
-      ['P-10402', doctor.id, 'Meera Iyer', 'Kidney', 'AB+', 61.2, 'Waiting'],
-      ['P-10375', doctor.id, 'Sanjay Kapoor', 'Lung', 'O-', 58.9, 'Waiting'],
-    ];
-    for (const [code, registeredBy, name, organ, blood, urgency, status] of patients) {
-      await client.query(
-        `INSERT INTO patients (code, name, organ_needed, blood_type, urgency_score, registered_hospital_id, registered_by, waitlist_status, hla_markers)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [code, name, organ, blood, urgency, cityGeneral.id, registeredBy, status, randomHlaMarkers()]
-      );
-    }
-
-    await client.query('COMMIT');
-    console.log('Database seeded successfully.');
-    console.log('3 jurisdictions seeded: Sector 12 -> Sector 7 -> MG Road Junction');
-    console.log('Demo login: any *@organmatch.dev account, password: password123');
-    console.log('Police accounts: police@ (Sector 12), police2@ (Sector 7), police3@ (MG Road)');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-    await pool.end();
+export async function seedIfEmpty() {
+  const existingCount = await User.countDocuments({});
+  if (existingCount > 0) {
+    console.log('[Seed] Database already has data — skipping auto-seed.');
+    return;
   }
+  await runSeed();
 }
 
-seed().catch((err) => {
-  console.error('Failed to seed database:', err);
-  process.exit(1);
-});
+async function runSeed() {
+  // Clear any existing data so re-seeding is idempotent
+  await Promise.all([
+    Hospital.deleteMany({}),
+    Jurisdiction.deleteMany({}),
+    User.deleteMany({}),
+    Vehicle.deleteMany({}),
+    Patient.deleteMany({}),
+  ]);
+
+  // ---------- Hospitals ----------
+  const stXavier = await Hospital.create({
+    name: 'St. Xavier Medical Center',
+    location_lat: 13.0827,
+    location_lng: 80.2707,
+    type: 'donor',
+    address: 'Chennai, TN',
+  });
+  const cityGeneral = await Hospital.create({
+    name: 'City General Hospital',
+    location_lat: 13.0604,
+    location_lng: 80.2496,
+    type: 'recipient',
+    address: 'Chennai, TN',
+  });
+
+  // ---------- Jurisdictions ----------
+  const sector12 = await Jurisdiction.create({
+    name: 'Sector 12 Traffic Control',
+    control_room_contact: '+91 44 2222 1111',
+    sequence_hint: 1,
+  });
+  const sector7 = await Jurisdiction.create({
+    name: 'Sector 7 Traffic Control',
+    control_room_contact: '+91 44 2222 2222',
+    sequence_hint: 2,
+  });
+  const mgRoad = await Jurisdiction.create({
+    name: 'MG Road Junction Control',
+    control_room_contact: '+91 44 2222 3333',
+    sequence_hint: 3,
+  });
+
+  const passwordHash = await bcrypt.hash('password123', 10);
+
+  // ---------- Users ----------
+  const doctor = await User.create({
+    name: 'Dr. Fatima Rahman',
+    email: 'doctor@organmatch.dev',
+    password_hash: passwordHash,
+    role: 'DOCTOR',
+    contact_number: '+91 98450 11122',
+    hospital_id: stXavier._id,
+    license_number: 'MED-88213',
+  });
+
+  await User.create({
+    name: 'Kavya Suresh',
+    email: 'admin@organmatch.dev',
+    password_hash: passwordHash,
+    role: 'HOSPITAL_ADMIN',
+    contact_number: '+91 90000 11223',
+    hospital_id: cityGeneral._id,
+  });
+
+  await User.create({
+    name: 'Rahul Verma',
+    email: 'donor@organmatch.dev',
+    password_hash: passwordHash,
+    role: 'DONOR_COORDINATOR',
+    contact_number: '+91 99887 66554',
+    hospital_id: stXavier._id,
+  });
+
+  await User.create({
+    name: 'Ananya Iyer',
+    email: 'sysadmin@organmatch.dev',
+    password_hash: passwordHash,
+    role: 'SYSTEM_ADMIN',
+    contact_number: '+91 91234 56780',
+    organization_name: 'National Organ Registry',
+  });
+
+  const ambulanceDriver = await User.create({
+    name: 'Suresh Kumar',
+    email: 'ambulance@organmatch.dev',
+    password_hash: passwordHash,
+    role: 'AMBULANCE',
+    contact_number: '+91 97865 43221',
+    license_id: 'DL-44219',
+  });
+
+  await User.create({
+    name: 'Inspector Vikram Singh',
+    email: 'police@organmatch.dev',
+    password_hash: passwordHash,
+    role: 'POLICE',
+    contact_number: '+91 90111 22334',
+    station_name: 'Sector 12 Traffic Control',
+    jurisdiction_id: sector12._id,
+  });
+
+  await User.create({
+    name: 'Inspector Meena Pillai',
+    email: 'police2@organmatch.dev',
+    password_hash: passwordHash,
+    role: 'POLICE',
+    contact_number: '+91 90111 33445',
+    station_name: 'Sector 7 Traffic Control',
+    jurisdiction_id: sector7._id,
+  });
+
+  await User.create({
+    name: 'Inspector Arjun Reddy',
+    email: 'police3@organmatch.dev',
+    password_hash: passwordHash,
+    role: 'POLICE',
+    contact_number: '+91 90111 44556',
+    station_name: 'MG Road Junction Control',
+    jurisdiction_id: mgRoad._id,
+  });
+
+  const patientUser = await User.create({
+    name: 'Arjun Menon',
+    email: 'patient@organmatch.dev',
+    password_hash: passwordHash,
+    role: 'PATIENT',
+    contact_number: '+91 98765 43210',
+    organ_needed: 'Kidney',
+    blood_type: 'O+',
+    urgency_score: 92.4,
+    registered_hospital_name: 'City General Hospital',
+    waitlist_status: 'Matched',
+  });
+
+  // ---------- Vehicle ----------
+  await Vehicle.create({
+    code: 'AMB-114',
+    registration_number: 'TN-09-AB-4521',
+    status: 'Idle',
+    driver_id: ambulanceDriver._id,
+  });
+
+  // ---------- Patients (waitlist) ----------
+  const patientRecords = [
+    { code: 'P-10432', userId: patientUser._id, name: 'Arjun Menon', organ: 'Kidney', blood: 'O+', urgency: 92.4, status: 'Matched' },
+    { code: 'P-10388', userId: doctor._id, name: 'Priya Nair', organ: 'Liver', blood: 'B+', urgency: 78.1, status: 'Waiting' },
+    { code: 'P-10391', userId: doctor._id, name: 'Rohan Das', organ: 'Heart', blood: 'A-', urgency: 74.6, status: 'Waiting' },
+    { code: 'P-10402', userId: doctor._id, name: 'Meera Iyer', organ: 'Kidney', blood: 'AB+', urgency: 61.2, status: 'Waiting' },
+    { code: 'P-10375', userId: doctor._id, name: 'Sanjay Kapoor', organ: 'Lung', blood: 'O-', urgency: 58.9, status: 'Waiting' },
+  ];
+
+  for (const p of patientRecords) {
+    await Patient.create({
+      code: p.code,
+      name: p.name,
+      organ_needed: p.organ,
+      blood_type: p.blood,
+      urgency_score: p.urgency,
+      registered_hospital_id: cityGeneral._id,
+      registered_by: p.userId,
+      waitlist_status: p.status,
+      hla_markers: randomHlaMarkers(),
+    });
+  }
+
+  console.log('[Seed] Database seeded successfully.');
+  console.log('[Seed] 3 jurisdictions: Sector 12 -> Sector 7 -> MG Road Junction');
+  console.log('[Seed] Demo login: any *@organmatch.dev account, password: password123');
+  console.log('[Seed] Police accounts: police@ (Sector 12), police2@ (Sector 7), police3@ (MG Road)');
+}
+
+// Support standalone CLI invocation: node src/db/seed.js
+const isMain = process.argv[1]?.endsWith('seed.js');
+if (isMain) {
+  (async () => {
+    await connectDB();
+    await runSeed();
+    await disconnectDB();
+  })().catch((err) => {
+    console.error('Failed to seed database:', err);
+    process.exit(1);
+  });
+}

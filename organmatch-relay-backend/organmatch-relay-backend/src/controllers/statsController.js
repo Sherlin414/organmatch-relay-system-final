@@ -1,35 +1,55 @@
-import { pool } from '../db/pool.js';
+import { AuditLog, Match, Patient, Hospital } from '../models/index.js';
 import { verifyChainIntegrity } from '../services/auditLogService.js';
 
 export async function listAuditLog(req, res) {
-  const { rows } = await pool.query(
-    `SELECT al.*, m.code AS match_code
-     FROM audit_logs al
-     LEFT JOIN matches m ON m.id = al.related_match_id
-     ORDER BY al.timestamp DESC LIMIT 50`
-  );
+  const entries = await AuditLog.find()
+    .sort({ timestamp: -1 })
+    .limit(50)
+    .populate({ path: 'related_match_id', select: 'code' })
+    .lean();
+
+  // Map populated field to include match_code for frontend compatibility
+  const mapped = entries.map((entry) => ({
+    ...entry,
+    match_code: entry.related_match_id?.code ?? null,
+  }));
+
   const chainValid = await verifyChainIntegrity();
-  res.json({ entries: rows, chainValid });
+  res.json({ entries: mapped, chainValid });
 }
 
 export async function networkStats(req, res) {
-  const [{ rows: [activeMatches] }, { rows: [patientsWaiting] }, { rows: [hospitals] }] = await Promise.all([
-    pool.query(`SELECT COUNT(*)::int AS count FROM matches WHERE status IN ('Proposed', 'Confirmed')`),
-    pool.query(`SELECT COUNT(*)::int AS count FROM patients WHERE waitlist_status = 'Waiting'`),
-    pool.query(`SELECT COUNT(*)::int AS count FROM hospitals`),
+  const [activeMatches, patientsWaiting, hospitalCount] = await Promise.all([
+    Match.countDocuments({ status: { $in: ['Proposed', 'Confirmed'] } }),
+    Patient.countDocuments({ waitlist_status: 'Waiting' }),
+    Hospital.countDocuments({}),
   ]);
 
-  const { rows: [avgTime] } = await pool.query(
-    `SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (confirmed_at - created_at)) / 60), 0)::numeric(6,1) AS avg_minutes
-     FROM matches WHERE confirmed_at IS NOT NULL`
-  );
+  // Average minutes from created_at to confirmed_at for confirmed matches
+  const avgResult = await Match.aggregate([
+    { $match: { confirmed_at: { $ne: null } } },
+    {
+      $project: {
+        diffMinutes: {
+          $divide: [
+            { $subtract: ['$confirmed_at', '$created_at'] },
+            60000, // ms → minutes
+          ],
+        },
+      },
+    },
+    { $group: { _id: null, avg: { $avg: '$diffMinutes' } } },
+  ]);
+
+  const avgMinutes =
+    avgResult.length > 0 ? Number(avgResult[0].avg).toFixed(1) : '0.0';
 
   res.json({
     stats: [
-      { label: 'Active Matches', value: String(activeMatches.count) },
-      { label: 'Patients Waiting', value: String(patientsWaiting.count) },
-      { label: 'Hospitals Connected', value: String(hospitals.count) },
-      { label: 'Avg. Match Time', value: `${avgTime.avg_minutes} min` },
+      { label: 'Active Matches', value: String(activeMatches) },
+      { label: 'Patients Waiting', value: String(patientsWaiting) },
+      { label: 'Hospitals Connected', value: String(hospitalCount) },
+      { label: 'Avg. Match Time', value: `${avgMinutes} min` },
     ],
   });
 }
